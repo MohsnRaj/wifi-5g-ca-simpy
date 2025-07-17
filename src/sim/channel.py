@@ -97,7 +97,10 @@ class BaseStation:
         # will be computed externally
         self.global_share = 1.0
         self.served_cells = []
-
+        self.backoff_event = env.event()        # یک Event خالی برای broadcast
+        self.cells = []
+    def register(self, cell):
+        self.cells.append(cell)
     @property
     def user_count(self) -> int:
         """Return the number of attached cells (users)."""
@@ -106,19 +109,12 @@ class BaseStation:
     def attach(self, cell):
         cell.base_station = self
         self.served_cells.append(cell)
-    def monitor(self, interval=1.0,K=10):
-        busy_time = 0.0
-        samples   = 0
+    def monitor(self, interval=0.1):
         while True:
-            idle = self.channel.is_idle(self.band,
-                                    rx_cell=self,
-                           ed_threshold_dBm=self.ed_threshold)
-            busy_time += (not idle)
-            samples   += 1
-            if samples >= K:          # you’ll need to have K in scope or pass it in
-                busy_frac = busy_time / samples
-                self.global_share = max(0.01, 1.0 - busy_frac)
-                busy_time = 0
-                samples   = 0
+            idle = self.channel.is_idle(self.band, self, self.ed_threshold)
+            if not idle:
+            # کانال توسط هرکدام از ترافیک‌ها اشغال است
+            # سیگنال backoff را broadcast می‌کنیم
+                self.backoff_event.succeed()          # Event را Trigger کن
+                self.backoff_event = self.env.event() # و یک Event نو بساز
             yield self.env.timeout(interval)
-
