@@ -1,80 +1,79 @@
 import simpy
 import random
 import numpy as np
+from .ca_rules import ca_decision
 
 class Cell:
     """
     A network cell node in the SimPy-based CA simulator.
-    Each cell registers itself and discovers neighbors.
-    It tracks its own state, exchanges metrics,
-    and applies a CA update rule before each slot.
+    Applies CSMA/CA (WiFi) or LBT (NR-U) + global share slot adjustment.
     """
-    registry = []  # registry of all cells
+    registry = []
 
-    def __init__(self, env: simpy.Environment, name: str, tech: str, channel, model=None):
+    def __init__(self, env, name, tech, channel, position, model=None, grid=None,priority_weight: float = 1.0):
         self.env = env
         self.name = name
-        self.tech = tech  # "WiFi" or "NR-U"
+        self.tech = tech
         self.channel = channel
+        self.position = position
+        self.grid = grid
         self.model = model
-
-        Cell.registry.append(self)
-        self.neighbors = []
-
-        # State and summary counters
-        self.state = {
-            'queue_len': 0,
-            'last_tx': False,
-            'cw': 4 if tech == 'NR-U' else 16,
-        }
+        self.priority_weight = priority_weight
+        self.cw = None
         self.tx_count = 0
         self.backoff_count = 0
+        self.state = {'queue_len':0, 'last_tx':False}
+        Cell.registry.append(self)
 
-        env.process(self.run())
-
-    def discover_neighbors(self):
-        self.neighbors = [c for c in Cell.registry if c is not self]
-
-    def update(self):
-        # On first call, discover neighbors
-        if not self.neighbors:
-            self.discover_neighbors()
-        # Simple fairness heuristic
-        avg_nbr_queue = sum(n.state['queue_len'] for n in self.neighbors) / len(self.neighbors) if self.neighbors else 0
-        if self.state['queue_len'] > avg_nbr_queue:
-            self.state['cw'] = max(1, self.state['cw'] // 2)
-        else:
-            self.state['cw'] = min(64, self.state['cw'] * 2)
+    def just_transmitted(self):
+        return self.state.get('last_tx', False)
 
     def generate_traffic(self):
-        """
-        Poisson arrivals per time unit (lam=0.5).
-        """
         return np.random.poisson(lam=0.5)
 
     def run(self):
-        slot_time = 0.001 if self.tech == 'NR-U' else 0.009
+        assert hasattr(self, 'base_station'), \
+            f"Cell {self.name} must be attached to a BaseStation before run()"
+        # base slot duration per technology
+        base_slot = 0.001 if self.tech=='NR-U' else 0.009
+        # initialize WiFi CW
+        if self.tech == 'WiFi':
+            self.cw = self.base_station.cw_min
         while True:
-            # CA update
-            self.update()
-
-            # Backoff countdown before sensing
-            backoff_slots = random.randint(1, self.state['cw'])
-            backoff_time = backoff_slots * slot_time
+           # زمان اسلات واقعی = پایه تقسیم بر سهم جهانی BS
+            slot_time = base_slot / self.base_station.global_share
+            # pick backoff slots
+            if self.tech == 'WiFi':
+                 raw_slots = random.randint(1, self.cw-1)
+                 backoff_slots = max(1, int(raw_slots / self.priority_weight))
+            else:
+                raw = ca_decision(self, self.grid, T=4, delta=1)
+                backoff_slots = max(1, int(raw / self.priority_weight))
             self.backoff_count += 1
-            yield self.env.timeout(backoff_time)
+            yield self.env.timeout(backoff_slots * slot_time)
 
-            # Sense channel
-            if self.channel.is_idle():
-                yield self.channel.occupy()
+            # sense channel with ED threshold
+            ed = self.base_station.ed_threshold
+            band = self.base_station.band
+            if self.channel.is_idle(band, self, ed):
+                # transmit
+                pkt_duration = 1.0 / self.base_station.global_share
+                self.channel.occupy(band, self, pkt_duration)
                 self.state['last_tx'] = True
                 self.tx_count += 1
-                print(f"{self.env.now:.3f}: {self.name} ({self.tech}) TX #{self.tx_count} CW={self.state['cw']}")
-                yield self.env.timeout(1)
-                yield self.channel.release()
+                print(f"{self.env.now:.6f}: {self.name} TX#{self.tx_count} on {band}")
+                yield self.env.timeout(pkt_duration)
+                self.channel.release(band, self)
+                # reset CW on success
+                if self.tech == 'WiFi':
+                    self.cw = self.base_station.cw_min
+                # add new traffic
+                arrivals = self.generate_traffic()
+                self.state['queue_len'] += arrivals
             else:
+                # busy or collision
                 self.state['last_tx'] = False
-
-            # Traffic arrivals at end of slot
-            arrivals = self.generate_traffic()
-            self.state['queue_len'] += arrivals
+                if self.tech == 'WiFi':
+                    self.cw = min(self.cw * 2, self.base_station.cw_max)
+                # loop again
+                continue
