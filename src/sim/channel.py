@@ -84,6 +84,7 @@ class BaseStation:
                  name: str, tech: str,
                  position: tuple, band: str,
                   cw_min=4, cw_max=1024, ed_threshold_dBm=None):
+        self.nav_expiry_time = 0.0
         self.env = env
         self.channel = channel
         self.name = name
@@ -109,12 +110,18 @@ class BaseStation:
     def attach(self, cell):
         cell.base_station = self
         self.served_cells.append(cell)
-    def monitor(self, interval=0.1):
+    def monitor(self, interval=0.1, busy_threshold=3, nav_duration=0.005):
+        busy_count = 0
         while True:
             idle = self.channel.is_idle(self.band, self, self.ed_threshold)
             if not idle:
-            # کانال توسط هرکدام از ترافیک‌ها اشغال است
-            # سیگنال backoff را broadcast می‌کنیم
-                self.backoff_event.succeed()          # Event را Trigger کن
-                self.backoff_event = self.env.event() # و یک Event نو بساز
+                busy_count += 1
+            else:
+                busy_count = 0
+
+            if busy_count >= busy_threshold:
+                print(f"[{self.name}] Channel busy → issuing NAV")
+                self.nav_expiry_time = self.env.now + nav_duration
+                busy_count = 0
+
             yield self.env.timeout(interval)
