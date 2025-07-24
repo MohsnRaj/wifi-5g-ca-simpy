@@ -22,6 +22,8 @@ class Channel:
                  rx_sensitivity_dBm=-82):
         self.env = env
         self.bands = bands
+        self.max_capacity = 1.0  # Max 1 second of usage per 1 second simulation time
+        self.used_capacity = 0.0
         self.tx_power = tx_power_dBm
         self.pl_e = pathloss_exponent
         self.noise_floor = noise_floor_dBm
@@ -42,6 +44,16 @@ class Channel:
         return True
 
     def occupy(self, band: str, tx_cell, duration: float):
+        # Drop or defer if over channel capacity
+        if self.used_capacity + duration > self.max_capacity:
+            # Simulate congestion: Drop packet or apply delay penalty
+            # Here: We'll drop the packet silently
+            if hasattr(tx_cell, "metrics"):
+                tx_cell.metrics.record_drop(tx_cell.name)  # optional
+            return
+
+        # Accept the transmission
+        self.used_capacity += duration
         end_time = self.env.now + duration
         self.transmissions[band].append((tx_cell, end_time))
 
@@ -83,7 +95,7 @@ class BaseStation:
                  channel: Channel,
                  name: str, tech: str,
                  position: tuple, band: str,
-                  cw_min=4, cw_max=1024, ed_threshold_dBm=None):
+                  cw_min=15, cw_max=63, ed_threshold_dBm=None):
         self.nav_expiry_time = 0.0
         self.env = env
         self.channel = channel
@@ -119,9 +131,56 @@ class BaseStation:
             else:
                 busy_count = 0
 
+         # [1] NAV برای WiFi مثل قبل
             if busy_count >= busy_threshold:
-                print(f"[{self.name}] Channel busy → issuing NAV")
+                # print(f"[{self.name}] Channel busy → issuing NAV")
                 self.nav_expiry_time = self.env.now + nav_duration
                 busy_count = 0
 
+        # [2] NEW: Backoff warning grant (for NR-U)
+            elif busy_count == busy_threshold - 1:
+                # print(f"[{self.name}] Predicting congestion → issuing backoff grant")
+                self.backoff_event.succeed()    # fire fairness‐based deferral
+                self.backoff_event = self.env.event()     # event جدید بساز
+
+            yield self.env.timeout(interval)
+    def monitor_fairness(self, interval=1.0,factor=8, recent_tx_threshold=3):
+        """
+        Periodically check if any user is starved.
+        We compute starvation_delay = factor × avg_delay_seconds at each step.
+        """
+        while True:
+            # 1) compute dynamic threshold (in seconds)
+            #    gather all recorded delays (in seconds) into one list
+            all_delays = [
+                d for delays in self.metrics.delay_records.values() for d in delays
+            ]
+            if all_delays:
+                avg_delay = sum(all_delays) / len(all_delays)
+            else:
+                avg_delay = interval  # fall back to one slot if no data yet
+            starvation_delay = avg_delay * factor
+
+        # 2) detect starving and fast users using this threshold
+            starved = []
+            fast_users = []
+            for cell in self.served_cells:
+                delays = self.metrics.delay_records.get(cell.name, [])
+                if not delays:
+                    continue
+                cell_avg = sum(delays) / len(delays)
+                if cell_avg > starvation_delay:
+                    starved.append(cell.name)
+            # “fast” = much faster than avg_delay
+                elif cell_avg < (avg_delay / factor) and cell.tx_count >= recent_tx_threshold:
+                    fast_users.append(cell)
+
+        # 3) if anyone truly starved, ask the fast ones to defer
+            if starved and fast_users:
+                # print(f"[{self.name}] Dynamic starvation threshold = {starvation_delay:.6f}s")
+                # print(f"[{self.name}] Starving: {starved}; telling fast {', '.join(f.name for f in fast_users)} to defer")
+                self.backoff_event.succeed()
+                self.backoff_event = self.env.event()
+
+        # 4) wait one slot before re-checking
             yield self.env.timeout(interval)
