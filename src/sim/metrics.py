@@ -24,10 +24,12 @@ class Metrics:
         self.delay_records = defaultdict(list)
         self.last_success_time = {}
         self.starvation_threshold = 2.0  # seconds
+
     def get_t_value(self, cell_name):
-        if hasattr(self, 'cell_map') and cell_name in self.cell_map:
-            return getattr(self.cell_map[cell_name], 'T_dynamic', '?')
-        return '?'
+        if hasattr(self, "cell_map") and cell_name in self.cell_map:
+            return getattr(self.cell_map[cell_name], "T_dynamic", "?")
+        return "?"
+
     def record_delay(self, cell_name: str, delay: float):
         self.delay_records[cell_name].append(delay)
 
@@ -51,18 +53,17 @@ class Metrics:
         """Mark simulation end time"""
         self.stop_time = t1
 
-    def throughputs(self) -> dict:
-        """
-        Compute per-cell throughput as transmitted packets / duration.
-        """
-        duration = max(1e-6, self.stop_time - self.start_time)
+    def throughputs(self, now=None) -> dict:
+        """Compute per-cell throughput as transmitted packets / duration."""
+        end_time = self.stop_time if self.stop_time is not None else now
+        duration = max(1e-6, end_time - self.start_time)
         return {cell: len(times) / duration for cell, times in self.tx_times.items()}
 
-    def fairness(self) -> float:
+    def fairness(self, now=None) -> float:
         """
         Jain's fairness index over all cells' throughputs.
         """
-        tp = list(self.throughputs().values())
+        tp = list(self.throughputs(now).values())
         if not tp:
             return 0.0
         s1 = sum(tp)
@@ -93,7 +94,7 @@ class Metrics:
             for tech, vals in tech_tot.items()
         }
         avg_delay = {
-            cell: (sum(d) / len(d)) if d else 0.0
+            cell: (sum(d) / len(d)) * 1000 if d else 0.0  # ← تبدیل به ms
             for cell, d in self.delay_records.items()
         }
 
@@ -125,14 +126,14 @@ class Metrics:
             "packet_loss_rate_per_cell": loss_rate,
         }
 
-    def fairness_by_priority(self, priority_map: dict) -> dict:
+    def fairness_by_priority(self, priority_map: dict, now=None) -> dict:
         """
         Compute Jain's fairness separately for primary and secondary users.
         priority_map: dict of cell_name -> priority_weight
         Returns: dict with 'primary' and 'secondary' fairness indices
         """
         # Separate throughputs
-        tps = self.throughputs()
+        tps = self.throughputs(now)
         primary = []
         secondary = []
 
@@ -143,13 +144,11 @@ class Metrics:
                 secondary.append(tp)
 
         def jain(tp_list):
-            if not tp_list: return 0.0
+            if not tp_list:
+                return 0.0
             s1 = sum(tp_list)
             s2 = sum(x * x for x in tp_list)
             N = len(tp_list)
             return (s1 * s1) / (N * s2) if s2 > 0 else 0.0
 
-        return {
-            "primary": jain(primary),
-            "secondary": jain(secondary)
-        }
+        return {"primary": jain(primary), "secondary": jain(secondary)}
