@@ -144,7 +144,7 @@ class BaseStation:
                 self.backoff_event = self.env.event()     # event جدید بساز
 
             yield self.env.timeout(interval)
-    def monitor_fairness(self, interval=1.0,factor=8, recent_tx_threshold=3):
+    def monitor_fairness(self, interval=1.0,factor=4, recent_tx_threshold=3):
         """
         Periodically check if any user is starved.
         We compute starvation_delay = factor × avg_delay_seconds at each step.
