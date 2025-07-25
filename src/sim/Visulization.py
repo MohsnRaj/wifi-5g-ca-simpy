@@ -140,12 +140,37 @@ def plot_delay_bar_chart(cells_labeled, delay_values, delays, starved, m):
     plt.title("User-Level Delay and Starvation")
     plt.grid(True)
 
-    for bar, cell in zip(bars, cell_names):
-        if cell in starved:
-            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(), 'Starved',
-                     ha='center', va='bottom', color='red', fontsize=8)
+    for bar, cell_name in zip(bars, cell_names):
+        # White delay text inside each bar
+        delay = delays.get(cell_name, 0.0)
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() / 2,
+            f"{delay:.2f} ms",
+            ha='center',
+            va='center',
+            fontsize=8,
+            color='white',
+            fontweight='bold'
+        )
+
+    # Optional: show "Starved" only if needed
+    if cell_name in starved:
+        plt.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.02,
+            "Starved",
+            ha='center',
+            va='bottom',
+            fontsize=8,
+            color='red'
+        )
 
     for bar, cell_name in zip(bars, cell_names):
         t_val = m.get_t_value(cell_name)
+        if isinstance(t_val, (float, int)):
+            label = f"T={round(t_val)}"
+        else:
+            label = "T=?"
         plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
-                 f"T={t_val}", ha='center', va='bottom', fontsize=8, color='black')
+                label, ha='center', va='bottom', fontsize=8, color='black')
