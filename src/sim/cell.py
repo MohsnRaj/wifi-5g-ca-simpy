@@ -15,6 +15,8 @@ class Cell:
         self.env = env
         self.queue_limit = queue_limit
         self.queue = []
+        self.my_delays = []     # list of delay samples
+        self.my_avg_delay = 0.0
         self.name = name
         self.tech = tech
         self.channel = channel
@@ -26,6 +28,7 @@ class Cell:
         self.priority_weight = priority_weight
         self.tx_count = 0
         self.backoff_count = 0
+        self.neighbor_info = {}  # stores latest status of same-tech neighbors
         self.state = {'queue_len':0, 'last_tx':False}
         # ─── EDCA-based CW/AIFS for Wi-Fi ───────────────────────────────────────
         if tech == "WiFi":
@@ -54,15 +57,16 @@ class Cell:
             else:
                 self.ac          = "NRU_Low"
                 self.cw_min      = 15
-                self.cw_max      = 1023
-                self.aifs_slots  = 4
-                self.txop_limit  = 0.0005  # 0.5 ms
+                self.cw_max      = 127
+                self.aifs_slots  = 2
+                self.txop_limit  = 0.0007  
 
         # pick initial CW in our new [cw_min…cw_max]
         self.cw = random.randint(self.cw_min, self.cw_max)
         self.T_min     = 2.0
         self.T_max     = 8.0  
         self.T_dynamic = random.uniform(2, 5)
+        self.gap_avg = 0.0
         self.last_tx_time = 0.0
         self.defer_time = 0.0
         self.slot_time = 0.0
@@ -70,12 +74,12 @@ class Cell:
         # Initialize these once before the while loop:
         if tech=="NR-U":
             self.alpha_gap = 0.9    # smoother gap estimate
-            self.dec_factor= 0.7    # less drastic cuts when congested
-            self.inc_step  = 0.3    # slower growth when underutilized
+            self.dec_factor= 0.8    # less drastic cuts when congested
+            self.inc_step  = 0.2    # slower growth when underutilized
         else:  # Wi-Fi
             self.alpha_gap = 0.8
-            self.dec_factor= 0.5
-            self.inc_step  = 0.5    
+            self.dec_factor= 0.4
+            self.inc_step  = 0.6    
         if phy_rate_bps is None:
             self.phy_rate_bps = 54e6 if tech=='WiFi' else 100e6
         else:
@@ -87,7 +91,8 @@ class Cell:
             self.env.process(self.traffic_generator_poisson(lam=nw_lam))
         else:
             self.env.process(self.traffic_generator_saturated())
-
+        self.env.process(self.periodic_broadcast())
+    
     def just_transmitted(self, window):
         # only count transmissions in the last `window` seconds
         return (self.env.now - self.last_tx_time) <= window
@@ -139,10 +144,86 @@ class Cell:
 
                 # now that queue is empty, enqueue one packet
                 self.queue.append(self.env.now)
+    def update_T_dynamic(self, defer_strength: int):
+        if defer_strength == 0:
+            return  
 
+        tech = self.tech
+        priority = self.ac  # e.g., "AC_BE", "AC_VO", "NRU_High", "NRU_Low"
+
+        # Decision logic
+        if tech == "WiFi":
+            if priority == "AC_VO":  # Primary
+                if defer_strength == 1:
+                    self.T_dynamic = min(self.T_dynamic + 0.6, self.T_max)
+                elif defer_strength == 2:
+                    self.T_dynamic = max(self.T_dynamic * 0.7, self.T_min)
+
+            elif priority == "AC_BE":  # Secondary
+                if defer_strength == 1:
+                    self.T_dynamic = min(self.T_dynamic + 0.9, self.T_max)
+                elif defer_strength == 2:
+                    self.T_dynamic = max(self.T_dynamic * 0.7, self.T_min)
+
+        elif tech == "NR-U":
+            if priority == "NRU_High":
+                if defer_strength == 1:
+                    self.T_dynamic = min(self.T_dynamic + 1, self.T_max)
+                elif defer_strength == 2:
+                    self.T_dynamic = max(self.T_dynamic * 0.9, self.T_min)
+
+            elif priority == "NRU_Low":
+                if defer_strength == 1:
+                    self.T_dynamic = min(self.T_dynamic + 0.05, self.T_max)
+                elif defer_strength == 2:
+                    self.T_dynamic = max(self.T_dynamic * 0.6, self.T_min)
+            if self.tech == "NR-U" and self.priority_weight < 1.5:
+                my_delays = self.base_station.metrics.delay_records.get(self.name, [])
+                if my_delays:
+                    avg_d = sum(my_delays)/len(my_delays)
+                    if avg_d > 0.0005:
+                        self.T_dynamic = max(self.T_dynamic * 0.8, self.T_min)
+    def broadcast_status(self):
+        """
+        Periodically broadcast this cell's MAC-level status to same-tech neighbors.
+        """
+        msg = {
+            "sender": self.name,
+            "priority": self.priority_weight,
+            "avg_delay": getattr(self, 'my_avg_delay', 0.0),
+            "cw": self.cw,
+            "T": self.T_dynamic,
+            "last_tx": self.last_tx_time,
+            "position": self.position,
+        }
+        msg['tx_count'] = self.tx_count
+        x, y = self.position
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                neighbor = self.grid.get((x + dx, y + dy))
+                # send only to same-technology neighbors
+                if neighbor and neighbor.tech == self.tech:
+                    neighbor.receive_status(msg)
+    def receive_status(self, msg):
+        """
+        Store received status from a same-tech neighbor.
+        """
+        self.neighbor_info[msg['sender']] = msg
+    def periodic_broadcast(self, interval=0.001):
+        """
+        Run broadcast_status() every 'interval' seconds.
+        """
+        while True:
+            self.broadcast_status()
+            yield self.env.timeout(interval)
     def neighbor_starvation_detected(self, delay_threshold=0.001):
         
         """Check delay of neighbors, return defer strength: 0 (none), 1 (mild), 2 (strong)"""
+        if self.tech == "NR-U":
+            delay_threshold *= 0.7
+        
         if self.grid is None or self.base_station is None:
             return 0
         metrics = self.base_station.metrics
@@ -161,6 +242,8 @@ class Cell:
                     delays = metrics.delay_records.get(neighbor.name, [])
                     if delays:
                         avg_delay = sum(delays)/len(delays)
+                        if neighbor.tech == "NR-U":
+                            avg_delay *= 1.4
                         if avg_delay > delay_threshold:
                             starving_neighbors.append((neighbor.name, avg_delay))
                             max_neighbor_delay = max(max_neighbor_delay, avg_delay)
@@ -178,84 +261,89 @@ class Cell:
         return 1
 
     def run(self):
-        
         assert hasattr(self, 'base_station'), \
             f"Cell {self.name} must be attached to a BaseStation before run()"
-    # base slot duration per technology
-        base_slot = 25e-6 if self.tech=='NR-U' else 9e-6
-        slot_time = base_slot / self.base_station.global_share
-        self.slot_time =slot_time
-        target_gap = self.T_dynamic * slot_time
-        self.gap_avg = target_gap
-        packet_bits = 1500 * 8
-        share     = self.base_station.global_share
-        avg_pkt_time = packet_bits / (self.phy_rate_bps * share)
-        # small initial jitter (0–10% of desired gap)
+
+        # ۱) پارامترهای اولیه
+        base_slot     = 25e-6 if self.tech=='NR-U' else 9e-6
+        packet_bits   = 1500 * 8
+        share         = self.base_station.global_share
+        avg_pkt_time  = packet_bits / (self.phy_rate_bps * share)
+
+        # ۲) jitter اولیه
         yield self.env.timeout(random.uniform(0, avg_pkt_time))
+
+        # ۳) صبر یک دوره broadcast تا neighbor_info پر بشه
+        yield self.env.timeout(0.0001)
+        # self.last_tx_time = self.env.now
+
+
+        # ۴) حلقه اصلی
         while True:
-            # --- compute EMA of transmission gap ---
-            measured_gap = self.env.now - self.last_tx_time
-            # EMA update: gap_avg = alpha * gap_avg + (1 - alpha) * measured_gap
-            self.gap_avg = (self.alpha_gap * self.gap_avg
-                            + (1 - self.alpha_gap) * measured_gap)
-
-            # --- update T_dynamic using AIMD ---
-            # Compare EMA gap with the target gap
-            if self.gap_avg < target_gap:
-                # congested: multiplicative decrease
-                self.T_dynamic = max(self.T_dynamic * self.dec_factor,
-                                    self.T_min)
-            else:
-                # underutilized: additive increase
-                self.T_dynamic = min(self.T_dynamic + self.inc_step,
-                                    self.T_max)
-
-            # --- recalculate target_gap after updating T_dynamic ---
+            
             slot_time  = base_slot / self.base_station.global_share
-            target_gap = self.T_dynamic * slot_time
+            if self.tx_count > 0:
+                # ——— EMA فاصله ارسال‌ها ———
+                measured_gap = self.env.now - self.last_tx_time
+                slot_time   = base_slot / self.base_station.global_share
+                gap_in_slots = (measured_gap / slot_time) /100
+                self.gap_avg = (self.alpha_gap * self.gap_avg
+                                + (1 - self.alpha_gap) * gap_in_slots)
 
-            # use the new T_dynamic everywhere
-            penalty_slots, defer_strength = ca_decision(self, self.grid, T=self.T_dynamic)
-            # defer_strength = self.neighbor_starvation_detected()
+                target_gap = self.T_dynamic
 
+                # ——— AIMD روی T_dynamic ———
+                # gap_ratio = (self.gap_avg/10) / self.T_dynamic  # ساده‌ترین فرم
+                # print(f"T_dynamic={self.T_dynamic:.2f}, gap_ratio={gap_ratio:.2f}")
+
+                # if gap_ratio > 1.2:  # مقدار قابل تنظیم برای حساسیت
+                #     self.T_dynamic = max(self.T_dynamic * self.dec_factor, self.T_min)
+                # else:
+                #     self.T_dynamic = min(self.T_dynamic + self.inc_step, self.T_max)
+                # print(f"[{self.name}] T_dynamic={self.T_dynamic:.2f}")n
+                # ——— میانگین busy_score همسایه‌ها ———
+                total_bs, count = 0.0, 0
+                for info in self.neighbor_info.values():
+                    age = self.env.now - info['last_tx']
+                    if age <= 0.005:
+                        total_bs += info['tx_count']
+                        count += 1
+                neighbor_busy_avg = total_bs / count if count else 0.0
+
+                # ——— دینامیک CW براساس busy_score ———
+                if neighbor_busy_avg > target_gap:
+                    self.cw = int(min(self.cw * 1.1, self.cw_max))
+                elif neighbor_busy_avg < 0.5 * target_gap:
+                    self.cw = int(max(self.cw * 0.9, self.cw_min))
+
+               
+            # ——— تصمیم CA با مقدار جدید T_dynamic ———
+            penalty_slots, defer_strength = ca_decision(self, self.grid,
+                                                    T=self.T_dynamic)
+            self.update_T_dynamic(defer_strength)
+
+            # —— بقیه‌ی logic backoff و ارسال ——
             if defer_strength == 2:
-            # Secondary user → full defer
-                defer_time = 2 * (base_slot / self.base_station.global_share)
-                # print(f"[{self.name}] (S) full defer due to neighbor starvation")
-                yield self.env.timeout(defer_time)
+                # Secondary full defer
+                yield self.env.timeout(2 * slot_time)
                 continue
             elif defer_strength == 1:
-            # Primary user → mild defer
-                defer_time = 1 * (base_slot / self.base_station.global_share)
-                # print(f"[{self.name}] (P) mild defer to help starved neighbor")
-                yield self.env.timeout(defer_time)
-            # not continue → continue with CA-decision
-            if penalty_slots > 0:
-                # we got deferred because neighbors outnumber our window → loosen
-                self.T_dynamic = min(self.T_dynamic + random.uniform(0.1, 0.5), 8)
-            else:
-                # we were allowed immediately → tighten for more fairness
-                self.T_dynamic = max(self.T_dynamic - random.uniform(0.1, 0.5), 2)
-            # 1) pick the normal CSMA/LBT backoff
-            raw_slots = random.randint(0, self.cw - 1)
+                # Primary mild defer
+                yield self.env.timeout(1 * slot_time)
+            # ادامه به CA logic
 
-            
-            # 3) combine them (ensure at least one slot)
+            # ۱) انتخاب backoff slots
+            raw_slots = (int(random.uniform(0, self.cw/2)) 
+                        if self.tech=="NR-U" else
+                        random.randint(0, self.cw-1))
             total_slots = max(1, raw_slots + penalty_slots)
 
-            # 4) convert to time
-            slot_time = base_slot / self.base_station.global_share
+            # ۲) backoff timeout
             backoff_timeout = self.env.timeout(total_slots * slot_time)
-            bs_backoff_evt = self.base_station.backoff_event
-
-            # 5) count it
-            self.backoff_count += 1
-
-            # 6) wait for backoff *or* BS grant
-            result = yield backoff_timeout | bs_backoff_evt
+            result = yield backoff_timeout | self.base_station.backoff_event
 
             # فقط اگر NR-U بود، از دستور BS اطاعت کن
-            if self.tech == 'NR-U' and bs_backoff_evt in result:
+            if self.tech == 'NR-U' and self.base_station.backoff_event in result:
                 # print(f"[{self.name}] Deferred by BS grant (Type-4 style)")
                 continue
 
@@ -282,7 +370,9 @@ class Cell:
                 
                 delay = self.env.now - self.queue.pop(0)
                 self.base_station.metrics.record_delay(self.name, delay)
-    
+                self.my_delays.append(delay)
+                alpha = 0.8
+                self.my_avg_delay = alpha * self.my_avg_delay + (1 - alpha) * delay
                 self.state['queue_len'] = len(self.queue)
                 self.state['last_tx'] = True
                 self.tx_count += 1
@@ -293,13 +383,13 @@ class Cell:
                 if success:
                     self.base_station.metrics.record_success(self.name)
                     self.last_tx_time = self.env.now
-                    self.T_dynamic = max(self.T_dynamic - 0.5, self.T_min)
+                    # self.T_dynamic = max(self.T_dynamic - 0.5, self.T_min)
                 # Reset CW on success
                     if self.tech == 'WiFi' or self.tech == 'NR-U':
                         self.cw = self.base_station.cw_min
                 else:
                     self.base_station.metrics.record_loss(self.name)
-                    self.T_dynamic = min(self.T_dynamic + 0.7, self.T_max)
+                    # self.T_dynamic = min(self.T_dynamic + 0.7, self.T_max)
                 # Double CW on failure (if applicable)
                     if self.tech == 'WiFi' or self.tech == 'NR-U':
                         self.cw = min(self.cw * 2, self.base_station.cw_max)
