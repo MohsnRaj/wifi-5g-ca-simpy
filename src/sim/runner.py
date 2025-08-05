@@ -10,8 +10,8 @@ from .Visulization import (
 import numpy as np
 import random
 
-
-def simulate(wifi_count, nru_count, sim_time=2.0):
+sim_time=2.0
+def simulate(wifi_count, nru_count, sim_time=sim_time):
     """
     Run a single simulation scenario with given number of Wi-Fi and NR-U users.
     Returns a Metrics instance with collected results.
@@ -35,7 +35,8 @@ def simulate(wifi_count, nru_count, sim_time=2.0):
     channel.occupy = record_occupy
 
     # Create base stations
-
+    wifi_bs_list = []
+    nru_bs_list = []
     wifi_bs = BaseStation(
         env,
         channel,
@@ -58,6 +59,8 @@ def simulate(wifi_count, nru_count, sim_time=2.0):
     )
     wifi_bs.metrics = metrics
     nru_bs.metrics = metrics
+    wifi_bs_list.append(wifi_bs)
+    nru_bs_list.append(nru_bs)
     # Instantiate and attach cells
     cells = []
     total = wifi_count + nru_count
@@ -103,15 +106,17 @@ def simulate(wifi_count, nru_count, sim_time=2.0):
         cells.append(cell)
 
     # 1. compute airtime shares
+    total_weight = sum(c.priority_weight for c in cells)
     wifi_weight = sum(c.priority_weight for c in cells if c.tech == "WiFi")
-    nru_weight = sum(c.priority_weight for c in cells if c.tech == "NR-U")
-    tot_w = wifi_weight + nru_weight
-    wifi_bs.global_share = wifi_weight / tot_w
-    nru_bs.global_share = nru_weight / tot_w
+    nru_weight  = total_weight - wifi_weight
 
-    # 2. pick your NAV/backoff‐grant parameters
+# نسبت به کل وزن
+    wifi_bs.global_share = wifi_weight / total_weight
+    nru_bs.global_share  = nru_weight / total_weight
+
+    # 2.  NAV/backoff‐grant parameters
     busy_th = 3  # number of consecutive busy‐samples before NAV
-    # you could also make busy_th a parameter to simulate()
+    # also make busy_th a parameter to simulate()
 
     # 3. compute each BS’s microsecond‐scale slot_time
     slot_time_wifi = 9e-6 / wifi_bs.global_share  # Wi-Fi slot = 9 μs
@@ -171,11 +176,11 @@ def main():
 
     # print(f"Running parameter sweep for 1 to {max_users} users per tech...")
     scenarios = [
-        (5, 5),
+        # (5, 5),
         # (10, 5),
         # (7, 15)
         # (8, 2),
-        # (6, 4)
+        (6, 4)
         # (20, 12),
         # (15, 25),
         # (30, 18)
@@ -203,7 +208,8 @@ def main():
         wifi_thr.append(rep["avg_throughput_per_tech"]["WiFi"])
         nru_thr.append(rep["avg_throughput_per_tech"]["NR-U"])
         fairness.append(rep["fairness"])
-        class_fair = m.fairness_by_priority(priority_map)
+        now = m.stop_time or sim_time
+        class_fair = m.fairness_by_priority(priority_map,now=now)
         fairness_by_class_list.append(class_fair)
         share_labels.append(f"WiFi={wifi_n}, NR-U={nru_n}")
     #     print(f"Fairness (Primary): {class_fair['primary']:.2f}, "

@@ -58,8 +58,8 @@ class Cell:
                 self.ac          = "NRU_Low"
                 self.cw_min      = 15
                 self.cw_max      = 127
-                self.aifs_slots  = 2
-                self.txop_limit  = 0.0007  
+                self.aifs_slots  = 1
+                self.txop_limit  = 0.002
 
         # pick initial CW in our new [cw_min…cw_max]
         self.cw = random.randint(self.cw_min, self.cw_max)
@@ -145,44 +145,72 @@ class Cell:
                 # now that queue is empty, enqueue one packet
                 self.queue.append(self.env.now)
     def update_T_dynamic(self, defer_strength: int):
+        """
+    Adjust T_dynamic based on defer signals from neighbor_starvation_detected():
+      - defer_strength = 0 → no change
+      - defer_strength = 1 → mild defer
+      - defer_strength = 2 → full defer
+    Smaller steps for NR-U to avoid too-aggressive swings.
+    """
         if defer_strength == 0:
-            return  
+            return  # nothing to do
 
-        tech = self.tech
-        priority = self.ac  # e.g., "AC_BE", "AC_VO", "NRU_High", "NRU_Low"
+        tech = self.tech       # "WiFi" or "NR-U"
+        prio = self.ac         # "AC_VO", "AC_BE", "NRU_High", or "NRU_Low"
 
-        # Decision logic
+        # -------------------------------
+        # 1) Wi-Fi logic (primaries & secondaries)
+        # -------------------------------
         if tech == "WiFi":
-            if priority == "AC_VO":  # Primary
+            if prio == "AC_VO":
+                # Voice (primary) ≔ gentle adjustment
                 if defer_strength == 1:
-                    self.T_dynamic = min(self.T_dynamic + 0.6, self.T_max)
-                elif defer_strength == 2:
-                    self.T_dynamic = max(self.T_dynamic * 0.7, self.T_min)
+                    # mild defer → increase T by +0.5 up to T_max
+                    self.T_dynamic = min(self.T_dynamic + 0.5, self.T_max)
+                else:
+                    # full defer → shrink T by 20% but no lower than T_min
+                    self.T_dynamic = max(self.T_dynamic * 0.8, self.T_min)
 
-            elif priority == "AC_BE":  # Secondary
+            else:  # AC_BE
+                # Best-effort (secondary) ≔ bit stronger than voice
                 if defer_strength == 1:
-                    self.T_dynamic = min(self.T_dynamic + 0.9, self.T_max)
-                elif defer_strength == 2:
-                    self.T_dynamic = max(self.T_dynamic * 0.7, self.T_min)
+                    self.T_dynamic = min(self.T_dynamic + 0.8, self.T_max)
+                else:
+                    self.T_dynamic = max(self.T_dynamic * 0.8, self.T_min)
 
-        elif tech == "NR-U":
-            if priority == "NRU_High":
+        # -------------------------------
+        # 2) NR-U logic with softer steps
+        # -------------------------------
+        else:  # tech == "NR-U"
+            if prio == "NRU_High":
+                # High-priority NR-U ≔ small step increases
                 if defer_strength == 1:
-                    self.T_dynamic = min(self.T_dynamic + 1, self.T_max)
-                elif defer_strength == 2:
+                    self.T_dynamic = min(self.T_dynamic + 0.5, self.T_max)
+                else:
+                    # reduce by just 5% on full defer
+                    self.T_dynamic = max(self.T_dynamic * 0.95, self.T_min)
+
+            else:  # NRU_Low
+                # Low-priority NR-U ≔ very mild increase
+                if defer_strength == 1:
+                    self.T_dynamic = min(self.T_dynamic + 0.2, self.T_max)
+                else:
+                    # shrink by 10% on full defer
                     self.T_dynamic = max(self.T_dynamic * 0.9, self.T_min)
 
-            elif priority == "NRU_Low":
-                if defer_strength == 1:
-                    self.T_dynamic = min(self.T_dynamic + 0.05, self.T_max)
-                elif defer_strength == 2:
-                    self.T_dynamic = max(self.T_dynamic * 0.6, self.T_min)
-            if self.tech == "NR-U" and self.priority_weight < 1.5:
-                my_delays = self.base_station.metrics.delay_records.get(self.name, [])
-                if my_delays:
-                    avg_d = sum(my_delays)/len(my_delays)
-                    if avg_d > 0.0005:
-                        self.T_dynamic = max(self.T_dynamic * 0.8, self.T_min)
+        # -------------------------------
+        # 3) Optional extra check for low-weight NR-U
+        # -------------------------------
+        # If this NR-U BS is “lightweight” and its actual delay is still too high,
+        # give it a small further reduction to catch up.
+        if tech == "NR-U" and self.priority_weight < 1.5:
+            delays = self.base_station.metrics.delay_records.get(self.name, [])
+            if delays:
+                avg_delay = sum(delays) / len(delays)
+                if avg_delay > 0.0005:
+                    # trim another 10%
+                    self.T_dynamic = max(self.T_dynamic * 0.9, self.T_min)
+
     def broadcast_status(self):
         """
         Periodically broadcast this cell's MAC-level status to same-tech neighbors.
@@ -222,7 +250,7 @@ class Cell:
         
         """Check delay of neighbors, return defer strength: 0 (none), 1 (mild), 2 (strong)"""
         if self.tech == "NR-U":
-            delay_threshold *= 0.7
+            delay_threshold *= 0.95
         
         if self.grid is None or self.base_station is None:
             return 0
@@ -292,16 +320,7 @@ class Cell:
 
                 target_gap = self.T_dynamic
 
-                # ——— AIMD روی T_dynamic ———
-                # gap_ratio = (self.gap_avg/10) / self.T_dynamic  # ساده‌ترین فرم
-                # print(f"T_dynamic={self.T_dynamic:.2f}, gap_ratio={gap_ratio:.2f}")
-
-                # if gap_ratio > 1.2:  # مقدار قابل تنظیم برای حساسیت
-                #     self.T_dynamic = max(self.T_dynamic * self.dec_factor, self.T_min)
-                # else:
-                #     self.T_dynamic = min(self.T_dynamic + self.inc_step, self.T_max)
-                # print(f"[{self.name}] T_dynamic={self.T_dynamic:.2f}")n
-                # ——— میانگین busy_score همسایه‌ها ———
+                
                 total_bs, count = 0.0, 0
                 for info in self.neighbor_info.values():
                     age = self.env.now - info['last_tx']

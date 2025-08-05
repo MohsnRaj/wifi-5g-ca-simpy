@@ -1,0 +1,68 @@
+\documentclass[12pt]{article}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\geometry{
+  top=1.8cm,
+  bottom=2.2cm,
+  left=2cm,
+  right=2cm
+}
+\title{Documentation for Channel Class}
+\author{Project: Fairness in WiFi and 5G Coexistence}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Channel Class Documentation}
+\label{sec:channel}
+
+The \texttt{Channel} class is a core component of the wireless coexistence simulator, representing a multi-band wireless medium. It handles signal propagation, capacity constraints, and ongoing transmission state across different frequency bands.
+
+\subsection*{Attributes}
+\begin{itemize}
+  \item \textbf{env}: The SimPy simulation environment controlling time and events.
+  \item \textbf{bands}: A tuple defining the frequency bands available (e.g., 2.4GHz, 5GHz, 6GHz).
+  \item \textbf{tx\_power\_dBm}: Transmit power of the sender node in decibels-milliwatts (default = 20).
+  \item \textbf{pathloss\_exponent}: Exponent used for modeling free-space signal decay (default = 3.0).
+  \item \textbf{noise\_floor\_dBm}: Ambient background noise level (default = -95 dBm).
+  \item \textbf{rx\_sensitivity\_dBm}: Minimum signal strength required for successful reception (default = -82 dBm).
+  \item \textbf{max\_capacity}: Maximum allowed channel usage per simulation second (1.0 represents full utilization).
+  \item \textbf{used\_capacity}: Tracks how much of the channel is currently being used.
+  \item \textbf{transmissions}: Dictionary mapping each band to its list of ongoing transmissions (each as a tuple of transmitter and end time).
+\end{itemize}
+
+\subsection*{Constructor}
+\begin{lstlisting}[language=Python]
+def __init__(self,
+             env: simpy.Environment,
+             bands=('2.4GHz', '5GHz', '6GHz'),
+             tx_power_dBm=20,
+             pathloss_exponent=3.0,
+             noise_floor_dBm=-95,
+             rx_sensitivity_dBm=-82):
+\end{lstlisting}
+
+\begin{itemize}
+  \item Initializes a channel object with configurable radio characteristics.
+  \item Prepares an internal registry for each band to track ongoing transmissions.
+\end{itemize}
+
+\subsection*{Purpose in Project}
+This class is essential to simulate real-world behavior of wireless media in a coexistence environment. It enables:
+
+\begin{itemize}
+  \item Simulating interference and collisions across multiple radios (Wi-Fi vs. 5G NR-U).
+  \item Estimating whether a message can be received based on signal strength and interference.
+  \item Supporting Cellular Automata rules by giving feedback on signal conditions.
+\end{itemize}
+
+
+The \texttt{Channel} object models the local view of the medium required for CA-based decentralized decision-making.
+
+\end{document}

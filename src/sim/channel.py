@@ -91,11 +91,27 @@ class BaseStation:
         user_count: number of attached cells
         global_share: estimated share of spectrum (set by runner)
     """
+    registry = []
+    @property
+     
+    def avg_delay(self) -> float:
+         """
+         میانگین تاخیر تمام کاربران (cells) متصل به این BS را
+         از رکوردهای metrics محاسبه می‌کند.
+         """
+         delays = []
+         for cell in self.served_cells:
+             # لیست تاخیرهای این سلول از metrics
+             cell_delays = self.metrics.delay_records.get(cell.name, [])
+             delays.extend(cell_delays)
+         return sum(delays) / len(delays) if delays else 0.0
+
     def __init__(self, env: simpy.Environment,
                  channel: Channel,
                  name: str, tech: str,
                  position: tuple, band: str,
                   cw_min=15, cw_max=63, ed_threshold_dBm=None):
+        BaseStation.registry.append(self)
         self.nav_expiry_time = 0.0
         self.env = env
         self.channel = channel
@@ -110,7 +126,17 @@ class BaseStation:
         # will be computed externally
         self.global_share = 1.0
         self.served_cells = []
-        self.backoff_event = env.event()        # یک Event خالی برای broadcast
+        self.backoff_event = env.event() 
+        self.fairness_interval = 0.2
+        self.min_share = 0.5
+        self.max_share = 1.5
+        self.fairness_threshold = 1.02
+        self.error_integral = 0.0
+        self.target_delay = None
+        self.Kp = 0.05
+        self.Ki = 0.01
+        self.integral_limit = 0.5 
+        self.env.process(self._local_fairness_monitor())
         self.cells = []
     def register(self, cell):
         self.cells.append(cell)
@@ -184,3 +210,48 @@ class BaseStation:
 
         # 4) wait one slot before re-checking
             yield self.env.timeout(interval)
+            
+    def _local_fairness_monitor(self):
+            """
+            هر fairness_interval ثانیه:
+          - avg_delay_self را محاسبه می‌کنیم
+          - تنها براساس آن خطا و انتگرال را update کرده
+            و سهم خود را تنظیم می‌کنیم.
+            """
+            while True:
+                yield self.env.timeout(self.fairness_interval)
+
+                delays = [
+            sum(self.metrics.delay_records[c.name]) / len(self.metrics.delay_records[c.name])
+            for c in self.served_cells
+            if self.metrics.delay_records.get(c.name)
+        ]
+                if not delays:
+                    continue
+                avg_delay_self = sum(delays) / len(delays)
+
+            
+                peers = [bs for bs in BaseStation.registry if bs is not self]
+                if not peers:
+                    continue
+                avg_delay_peer = sum(bs.avg_delay for bs in peers) / len(peers)
+
+                error = avg_delay_peer - avg_delay_self
+                self.error_integral += error * self.fairness_interval
+                
+                self.error_integral = max(
+                -self.integral_limit,
+                 min(self.error_integral, self.integral_limit)
+            )
+                adjustment = self.Kp * error + self.Ki * self.error_integral
+
+                adjustment = max(min(adjustment, 0.2), -0.2)
+
+                self.global_share = max(
+                self.min_share,
+                min(self.max_share, self.global_share + adjustment)
+            )
+
+                print(f"[{self.name}] "
+                  f"err={error:.4f}, int={self.error_integral:.4f}, "
+                  f"adj={adjustment:+.4f}, share={self.global_share:.2f}")

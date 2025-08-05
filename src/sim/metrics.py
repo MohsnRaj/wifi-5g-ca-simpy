@@ -53,17 +53,51 @@ class Metrics:
         """Mark simulation end time"""
         self.stop_time = t1
 
-    def throughputs(self, now=None) -> dict:
-        """Compute per-cell throughput as transmitted packets / duration."""
+    def throughputs(self, now) -> dict:
+        """
+    Compute per-cell *instantaneous* throughput as transmitted packets / duration
+    since the last call, for proper time-series plotting.
+    """
+        # اولین بار که فراخوانی می‌شود، مقادیر اولیه را ست کن
+        if not hasattr(self, '_last_tp_time'):
+            self._last_tp_time   = self.start_time
+            self._last_tx_counts = {cell: 0 for cell in self.tx_times}
+
+        # طول بازه زمانی
+        delta = max(1e-6, now - self._last_tp_time)
+
+        tps = {}
+        for cell, times in self.tx_times.items():
+            prev_count = self._last_tx_counts.get(cell, 0)
+            sent = len(times) - prev_count
+            tps[cell] = sent / delta
+
+    # به‌روزرسانی state برای نوبت بعدی
+        self._last_tp_time   = now
+        self._last_tx_counts = {cell: len(times) for cell, times in self.tx_times.items()}
+
+        return tps
+    def cumulative_throughputs(self, now=None) -> dict:
+        """
+        Compute average throughput over entire simulation (from start to now or stop).
+        Used for final reports.
+        """
         end_time = self.stop_time if self.stop_time is not None else now
         duration = max(1e-6, end_time - self.start_time)
         return {cell: len(times) / duration for cell, times in self.tx_times.items()}
-
     def fairness(self, now=None) -> float:
-        """
-        Jain's fairness index over all cells' throughputs.
-        """
-        tp = list(self.throughputs(now).values())
+        """Jain's index over per-cell instantaneous throughput"""
+        tp = list(self.throughputs(now).values()) 
+        if not tp:
+            return 0.0
+        s1 = sum(tp)
+        s2 = sum(x * x for x in tp)
+        N = len(tp)
+        return (s1 * s1) / (N * s2) if s2 > 0 else 0.0
+
+    def final_fairness(self) -> float:
+        """Jain's index over total cumulative throughput (برای گزارش نهایی)"""
+        tp = list(self.cumulative_throughputs().values())
         if not tp:
             return 0.0
         s1 = sum(tp)
@@ -81,7 +115,7 @@ class Metrics:
          - packet_loss_rate_per_cell
         """
         # Compute per-cell throughput
-        tps = self.throughputs()
+        tps = self.cumulative_throughputs()
 
         # Compute average throughput per tech
         tech_tot = defaultdict(list)
@@ -121,7 +155,7 @@ class Metrics:
             "avg_throughput_per_tech": avg,
             "average_delay_per_cell": avg_delay,
             "starved_cells": starved,
-            "fairness": self.fairness(),
+            "fairness": self.final_fairness(),
             "total_cells": len(tps),
             "packet_loss_rate_per_cell": loss_rate,
         }
@@ -133,7 +167,7 @@ class Metrics:
         Returns: dict with 'primary' and 'secondary' fairness indices
         """
         # Separate throughputs
-        tps = self.throughputs(now)
+        tps = self.cumulative_throughputs(now)
         primary = []
         secondary = []
 
